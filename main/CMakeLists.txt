@@ -1,0 +1,25 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        "awp_protocol.c"
+        "awp_stream.c"
+        "awp_edge_node.c"
+        "awp_crypto.c"
+        "crypto_test.c"
+        "sensor_hub.c"
+    INCLUDE_DIRS "."
+    REQUIRES
+        nvs_flash
+        esp_wifi
+        esp_netif
+        esp_event
+        lwip
+        mbedtls
+        driver
+        esp_adc
+        esp_timer
+        json
+        app_update
+        blake3
+        mlkem768
+)

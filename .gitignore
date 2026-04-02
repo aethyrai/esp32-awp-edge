@@ -1,0 +1,32 @@
+build/
+sdkconfig
+sdkconfig.old
+managed_components/
+dependencies.lock
+*.pyc
+__pycache__/
+.vscode/
+
+# Keys and secrets — NEVER commit
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Test binaries (host-compiled, not ESP32)
+test/fuzz_awp
+test/test_hdc
+test/test_interop
+test/test_stress
+
+# Logs
+log/
+
+# Demo artifacts
+demo.cast
+demo.gif
+demo.mp4
+
+# Internal docs and benchmarks — protocol details stay private
+docs/
+BENCHMARKS.md

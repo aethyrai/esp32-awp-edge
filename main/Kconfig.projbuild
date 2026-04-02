@@ -1,0 +1,72 @@
+menu "AWP Edge Node Configuration"
+
+    config AWP_WIFI_SSID
+        string "WiFi SSID"
+        default "YOUR_SSID"
+        help
+            WiFi network name.
+
+    config AWP_WIFI_PASSWORD
+        string "WiFi Password"
+        default "YOUR_PASSWORD"
+        help
+            WiFi network password.
+
+    config AWP_UPSTREAM_HOST
+        string "Upstream node IP address"
+        default "192.168.1.100"
+        help
+            IP address of the upstream AIOS CORE/NODE to connect to.
+
+    config AWP_UPSTREAM_PORT
+        int "Upstream node port"
+        default 9000
+        help
+            AWP port of the upstream node.
+
+    config AWP_LISTEN_PORT
+        int "Local AWP listen port"
+        default 9200
+        help
+            Port this edge node listens on for local connections.
+
+    config AWP_NODE_NAME
+        string "Node name"
+        default "esp32-edge"
+        help
+            Human-readable name for this edge node.
+
+    config AWP_HDC_CACHE_CAPACITY
+        int "HDC cache capacity (vectors)"
+        default 64
+        help
+            Number of HDC vectors to cache locally. Limited by RAM.
+
+    config AWP_SENSOR_POLL_INTERVAL_MS
+        int "Sensor poll interval (ms)"
+        default 5000
+        help
+            How often to read sensors and report telemetry.
+
+    config AWP_HEARTBEAT_INTERVAL_MS
+        int "Heartbeat interval (ms)"
+        default 10000
+        help
+            How often to send PING to upstream node.
+
+    config AWP_PSK
+        string "Pre-shared key (hex, up to 64 bytes)"
+        default ""
+        help
+            Hex-encoded pre-shared key for mutual authentication.
+            Both edge node and upstream must have the same PSK.
+            Leave empty to disable (WARNING: MITM possible without PSK).
+            Can also be provisioned via NVS key "awp_psk" in namespace "awp_crypto".
+
+    config AWP_RECONNECT_BACKOFF_MAX_MS
+        int "Max reconnect backoff (ms)"
+        default 60000
+        help
+            Maximum delay between reconnection attempts (exponential backoff).
+
+endmenu
