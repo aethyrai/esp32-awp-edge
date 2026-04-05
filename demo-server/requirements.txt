@@ -1,0 +1,5 @@
+# Required: none (stdlib only)
+# Optional: better hash performance
+blake3>=1.0.0; python_version>="3.8"
+# Optional: post-quantum crypto (ML-KEM-768)
+# pip install psam-crypto
