@@ -14,6 +14,7 @@
 #include <unistd.h>
 
 #include "esp_log.h"
+#include "esp_system.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_netif.h"
@@ -230,42 +231,41 @@ static awp_err_t do_handshake(edge_node_t *node)
     node->crypto.replay_top = 0;
     node->crypto.replay_bitmap = 0;
 
-    /* Build HELLO payload */
-    cJSON *jhello = cJSON_CreateObject();
-    cJSON_AddStringToObject(jhello, "node_id", node->node_id);
-    cJSON_AddStringToObject(jhello, "name", node->config.node_name);
-    cJSON_AddNumberToObject(jhello, "tier", 1);
-    cJSON_AddNumberToObject(jhello, "subtype", 1);
-
-    char addr_buf[32];
-    snprintf(addr_buf, sizeof(addr_buf), "0.0.0.0:%d", (int)node->config.listen_port);
-    cJSON_AddStringToObject(jhello, "address", addr_buf);
-
-    cJSON *caps = cJSON_AddArrayToObject(jhello, "capabilities");
-    cJSON_AddItemToArray(caps, cJSON_CreateNumber(11));
-    cJSON_AddItemToArray(caps, cJSON_CreateNumber(10));
-    cJSON_AddNumberToObject(jhello, "hdc_capacity", (int)node->cache.capacity);
-
+    /* Build HELLO payload — static buffer, no heap allocation */
+    static char hello_json[3072];
+    char kem_ek_hex[AWP_KEM_PK_SIZE * 2 + 1];
+    kem_ek_hex[0] = '\0';
     if (node->crypto.kem_ready) {
-        char kem_ek_hex[AWP_KEM_PK_SIZE * 2 + 1];
         awp_crypto_get_ek_hex(&node->crypto, kem_ek_hex, sizeof(kem_ek_hex));
-        cJSON_AddStringToObject(jhello, "kem_encapsulation_key", kem_ek_hex);
     }
 
-    char *payload = cJSON_PrintUnformatted(jhello);
-    cJSON_Delete(jhello);
-    if (!payload) return AWP_ERR_ENCODE;
-    int plen = strlen(payload);
+    int plen;
+    if (kem_ek_hex[0]) {
+        plen = snprintf(hello_json, sizeof(hello_json),
+            "{\"node_id\":\"%s\",\"name\":\"%s\",\"tier\":1,\"subtype\":1,"
+            "\"address\":\"0.0.0.0:%d\",\"capabilities\":[11,10],"
+            "\"hdc_capacity\":%d,\"kem_encapsulation_key\":\"%s\"}",
+            node->node_id, node->config.node_name,
+            (int)node->config.listen_port, (int)node->cache.capacity,
+            kem_ek_hex);
+    } else {
+        plen = snprintf(hello_json, sizeof(hello_json),
+            "{\"node_id\":\"%s\",\"name\":\"%s\",\"tier\":1,\"subtype\":1,"
+            "\"address\":\"0.0.0.0:%d\",\"capabilities\":[11,10],"
+            "\"hdc_capacity\":%d}",
+            node->node_id, node->config.node_name,
+            (int)node->config.listen_port, (int)node->cache.capacity);
+    }
+    if (plen < 0 || plen >= (int)sizeof(hello_json)) return AWP_ERR_ENCODE;
 
     awp_frame_t hello;
     fill_identity(node, &hello);
     hello.msg_type = AWP_MSG_HELLO;
-    hello.payload = (uint8_t *)payload;
+    hello.payload = (uint8_t *)hello_json;
     hello.payload_len = plen;
 
     size_t enc_len = 0;
     awp_err_t err = awp_encode_frame(&hello, node->tx_buf, sizeof(node->tx_buf), &enc_len);
-    cJSON_free(payload);
     if (err != AWP_OK) return err;
 
     ESP_LOGI(TAG, "HELLO payload: %d bytes (KEM key %s)",
@@ -351,7 +351,7 @@ static awp_err_t do_handshake(edge_node_t *node)
                         return AWP_ERR_DECODE;
                     }
 
-                    /* Send auth token */
+                    /* Send auth token — static buffer, no heap allocation */
                     uint8_t auth_token[32];
                     awp_crypto_auth_token(&node->crypto, node->node_id, auth_token);
 
@@ -360,22 +360,18 @@ static awp_err_t do_handshake(edge_node_t *node)
                         sprintf(token_hex + t*2, "%02x", auth_token[t]);
                     token_hex[64] = '\0';
 
-                    cJSON *jauth = cJSON_CreateObject();
-                    cJSON_AddStringToObject(jauth, "type", "node_auth");
-                    cJSON_AddStringToObject(jauth, "node_id", node->node_id);
-                    cJSON_AddStringToObject(jauth, "token", token_hex);
-                    char *auth_str = cJSON_PrintUnformatted(jauth);
-                    cJSON_Delete(jauth);
+                    static char auth_json[192];
+                    int auth_len = snprintf(auth_json, sizeof(auth_json),
+                        "{\"type\":\"node_auth\",\"node_id\":\"%s\",\"token\":\"%s\"}",
+                        node->node_id, token_hex);
 
-                    if (auth_str) {
+                    if (auth_len > 0 && auth_len < (int)sizeof(auth_json)) {
                         awp_frame_t auth_frame;
                         fill_identity(node, &auth_frame);
                         auth_frame.msg_type = AWP_MSG_CAPABILITY_ANNOUNCE;
-                        auth_frame.payload = (uint8_t *)auth_str;
-                        auth_frame.payload_len = strlen(auth_str);
-                        /* This will be auto-encrypted by edge_node_send */
+                        auth_frame.payload = (uint8_t *)auth_json;
+                        auth_frame.payload_len = auth_len;
                         edge_node_send(node, &auth_frame);
-                        cJSON_free(auth_str);
                     }
                     ESP_LOGI(TAG, "Sent encrypted auth token");
                 }
@@ -457,61 +453,42 @@ static void handle_upstream_frame(edge_node_t *node, const awp_frame_t *frame)
         break;
 
     case AWP_MSG_PING: {
-        /* Respond with PONG — uses edge_node_send for auto-encryption */
-        cJSON *jpong = cJSON_CreateObject();
-        cJSON_AddNumberToObject(jpong, "timestamp",
+        /* Respond with PONG — static buffer, no heap allocation */
+        static char pong_json[128];
+        int pong_len = snprintf(pong_json, sizeof(pong_json),
+            "{\"timestamp\":%.3f,\"ping_timestamp\":0,\"capabilities\":[]}",
             (double)(esp_timer_get_time() / 1000) / 1000.0);
-        cJSON_AddNumberToObject(jpong, "ping_timestamp", 0);
-        cJSON_AddItemToObject(jpong, "capabilities", cJSON_CreateArray());
-        char *pong_str = cJSON_PrintUnformatted(jpong);
-        cJSON_Delete(jpong);
 
-        if (pong_str) {
+        if (pong_len > 0 && pong_len < (int)sizeof(pong_json)) {
             awp_frame_t pong;
             fill_identity(node, &pong);
             pong.msg_type = AWP_MSG_PONG;
             pong.flags = AWP_FLAG_IS_RESPONSE;
-            pong.payload = (uint8_t *)pong_str;
-            pong.payload_len = strlen(pong_str);
+            pong.payload = (uint8_t *)pong_json;
+            pong.payload_len = pong_len;
             edge_node_send(node, &pong);
-            cJSON_free(pong_str);
         }
         break;
     }
 
     case AWP_MSG_DISCOVER_REQUEST: {
-        /* Respond with our node info — auto-encrypted */
-        char addr_buf[32];
-        snprintf(addr_buf, sizeof(addr_buf), "0.0.0.0:%d",
-                 (int)node->config.listen_port);
+        /* Respond with our node info — static buffer, no heap allocation */
+        static char disc_json[384];
+        int disc_len = snprintf(disc_json, sizeof(disc_json),
+            "{\"nodes\":[{\"node_id\":\"%s\",\"name\":\"%s\","
+            "\"tier\":1,\"subtype\":1,\"address\":\"0.0.0.0:%d\","
+            "\"capabilities\":[11,10],\"hdc_capacity\":%d}]}",
+            node->node_id, node->config.node_name,
+            (int)node->config.listen_port, (int)node->cache.capacity);
 
-        cJSON *jnode = cJSON_CreateObject();
-        cJSON_AddStringToObject(jnode, "node_id", node->node_id);
-        cJSON_AddStringToObject(jnode, "name", node->config.node_name);
-        cJSON_AddNumberToObject(jnode, "tier", 1);
-        cJSON_AddNumberToObject(jnode, "subtype", 1);
-        cJSON_AddStringToObject(jnode, "address", addr_buf);
-        cJSON *dcaps = cJSON_AddArrayToObject(jnode, "capabilities");
-        cJSON_AddItemToArray(dcaps, cJSON_CreateNumber(11));
-        cJSON_AddItemToArray(dcaps, cJSON_CreateNumber(10));
-        cJSON_AddNumberToObject(jnode, "hdc_capacity", (int)node->cache.capacity);
-
-        cJSON *jdisc = cJSON_CreateObject();
-        cJSON *nodes_arr = cJSON_AddArrayToObject(jdisc, "nodes");
-        cJSON_AddItemToArray(nodes_arr, jnode);
-
-        char *disc_str = cJSON_PrintUnformatted(jdisc);
-        cJSON_Delete(jdisc);
-
-        if (disc_str) {
+        if (disc_len > 0 && disc_len < (int)sizeof(disc_json)) {
             awp_frame_t resp;
             fill_identity(node, &resp);
             resp.msg_type = AWP_MSG_DISCOVER_RESPONSE;
             resp.flags = AWP_FLAG_IS_RESPONSE;
-            resp.payload = (uint8_t *)disc_str;
-            resp.payload_len = strlen(disc_str);
+            resp.payload = (uint8_t *)disc_json;
+            resp.payload_len = disc_len;
             edge_node_send(node, &resp);
-            cJSON_free(disc_str);
         }
         break;
     }
@@ -555,6 +532,15 @@ static void connection_task(void *arg)
 
         /* Connect if needed — exponential backoff on failure */
         if (node->state != EDGE_STATE_CONNECTED) {
+            /* Heap guard: if fragmentation is severe, reboot cleanly
+             * instead of churning allocations in a death spiral.
+             * KEM handshake needs ~4KB contiguous for keypair + JSON. */
+            size_t free_heap = esp_get_free_heap_size();
+            if (free_heap < 16384) {
+                ESP_LOGE(TAG, "Heap critically low (%zu bytes) — rebooting", free_heap);
+                esp_restart();
+            }
+
             static uint32_t backoff_ms = 1000;
             tcp_connect(node);
             if (node->state != EDGE_STATE_CONNECTED) {
@@ -597,9 +583,11 @@ static void connection_task(void *arg)
                     awp_crypto_has_session(&node->crypto) &&
                     frames[i].payload_len > AWP_ENCRYPT_OVERHEAD) {
 
-                    uint8_t *dec_buf = malloc(frames[i].payload_len);
+                    /* Static decrypt buffer — connection_task is single-threaded */
+                    static uint8_t dec_buf[AWP_ESP32_MAX_PAYLOAD];
                     size_t dec_len = 0;
-                    if (dec_buf && awp_crypto_decrypt(&node->crypto,
+                    if (frames[i].payload_len <= sizeof(dec_buf) &&
+                        awp_crypto_decrypt(&node->crypto,
                             frames[i].payload, frames[i].payload_len,
                             dec_buf, &dec_len)) {
                         /* Strip enclosed HDC signature from decrypted payload */
@@ -614,10 +602,8 @@ static void connection_task(void *arg)
                         }
                         frames[i].flags &= ~(AWP_FLAG_ENCRYPTED | AWP_FLAG_HDC_ENCLOSED);
                         handle_upstream_frame(node, &frames[i]);
-                        free(dec_buf);
                     } else {
                         ESP_LOGW(TAG, "Failed to decrypt frame 0x%02x", frames[i].msg_type);
-                        if (dec_buf) free(dec_buf);
                     }
                 } else {
                     handle_upstream_frame(node, &frames[i]);
@@ -673,36 +659,30 @@ static void heartbeat_task(void *arg)
         }
         if (!node->running) break;
 
-        /* Build PING with embedded diagnostics for remote monitoring */
-        cJSON *jping = cJSON_CreateObject();
-        cJSON_AddNumberToObject(jping, "timestamp",
-            (double)(esp_timer_get_time() / 1000) / 1000.0);
-        cJSON_AddNumberToObject(jping, "free_heap",
-            (double)esp_get_free_heap_size());
-        cJSON_AddNumberToObject(jping, "min_heap",
-            (double)esp_get_minimum_free_heap_size());
-        cJSON_AddNumberToObject(jping, "frames_sent",
-            (double)node->stats.frames_sent);
-        cJSON_AddNumberToObject(jping, "frames_recv",
-            (double)node->stats.frames_received);
-        cJSON_AddNumberToObject(jping, "reconnects",
-            (double)node->stats.reconnect_count);
-        cJSON_AddNumberToObject(jping, "uptime_ms",
+        /* Build PING with embedded diagnostics — static buffer, no heap allocation */
+        static char ping_json[256];
+        int ping_len = snprintf(ping_json, sizeof(ping_json),
+            "{\"timestamp\":%.3f,\"free_heap\":%lu,\"min_heap\":%lu,"
+            "\"frames_sent\":%lu,\"frames_recv\":%lu,\"reconnects\":%lu,"
+            "\"uptime_ms\":%.0f}",
+            (double)(esp_timer_get_time() / 1000) / 1000.0,
+            (unsigned long)esp_get_free_heap_size(),
+            (unsigned long)esp_get_minimum_free_heap_size(),
+            (unsigned long)node->stats.frames_sent,
+            (unsigned long)node->stats.frames_received,
+            (unsigned long)node->stats.reconnect_count,
             (double)(esp_timer_get_time() / 1000));
-        char *ping_str = cJSON_PrintUnformatted(jping);
-        cJSON_Delete(jping);
 
-        if (ping_str) {
+        if (ping_len > 0 && ping_len < (int)sizeof(ping_json)) {
             awp_frame_t ping;
             fill_identity(node, &ping);
             ping.msg_type = AWP_MSG_PING;
-            ping.payload = (uint8_t *)ping_str;
-            ping.payload_len = strlen(ping_str);
+            ping.payload = (uint8_t *)ping_json;
+            ping.payload_len = ping_len;
 
             if (edge_node_send(node, &ping) != AWP_OK) {
                 ESP_LOGW(TAG, "Heartbeat send failed");
             }
-            cJSON_free(ping_str);
         }
 
         /* Sleep in 3s chunks so WDT stays fed (timeout=5s) */
