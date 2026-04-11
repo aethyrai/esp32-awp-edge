@@ -20,9 +20,11 @@ extern "C" {
 #define AWP_STREAM_BUF_SIZE  (AWP_HEADER_SIZE + AWP_ESP32_MAX_PAYLOAD + AWP_CHECKSUM_SIZE + 1024)
 
 typedef struct {
-    uint8_t  buf[AWP_STREAM_BUF_SIZE];
-    size_t   len;       /* bytes currently in buffer */
-    uint32_t err_count; /* total decode errors */
+    uint8_t *buf;              /* allocated in PSRAM at init */
+    size_t   buf_size;
+    size_t   len;              /* bytes currently in buffer */
+    uint32_t err_count;        /* total decode errors */
+    uint32_t bytes_dropped;    /* bytes discarded on overflow */
 } awp_stream_t;
 
 /**

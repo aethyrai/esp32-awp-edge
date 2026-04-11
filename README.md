@@ -40,11 +40,11 @@ All numbers measured on ESP32-S3-WROOM-1 @ 240MHz, 50 iterations, reporting mean
 - **Constant-time cryptographic operations.** Timing side-channels mitigated.
 - **Nonce reuse prevention.** Counter persisted to flash, survives unclean power loss.
 - **Mutual authentication.** Session key possession verified at establishment.
-- **Boot self-test.** 13 crypto tests on every boot. Firmware halts on failure.
+- **Boot self-test.** 14 crypto tests on every boot. Firmware halts on failure.
 
 ### Verification
 
-- 13 self-tests on every boot
+- 14 self-tests on every boot
 - Cross-platform interop proven byte-for-byte
 - 410,000 fuzz iterations (AddressSanitizer + UBSan), zero crashes
 - 100,000 single-bit-flip tests, 100% detected
@@ -83,9 +83,10 @@ Crypto Self-Test Suite
   [9] ML-KEM-768: wrong secret key rejection...        PASS
   [10] INTEROP: BLAKE3 KDF matches Python...           PASS
   [11] INTEROP: decrypt Python-produced ciphertext...  PASS
-  [12] AWP: frame encode/decode round-trip...          PASS
-  [13] AWP: BLAKE3 checksum tamper detection...        PASS
-  ALL 13 TESTS PASSED (226ms)
+  [12] Replay window: accept / duplicate / too-old...  PASS
+  [13] AWP: frame encode/decode round-trip...          PASS
+  [14] AWP: BLAKE3 checksum tamper detection...        PASS
+  ALL 14 TESTS PASSED (261ms)
 
 ML-KEM-768 keypair ready
 WiFi connected

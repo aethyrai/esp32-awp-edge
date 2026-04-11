@@ -8,6 +8,7 @@
  *  - ADC (analog: temperature, light, moisture, current)
  *  - GPIO (digital: PIR motion, reed switch, button)
  *  - I2C (bus: BME280, SHT31, BH1750, etc.)
+ *  - VIRTUAL (computed/derived values)
  */
 
 #pragma once
@@ -15,6 +16,9 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -32,7 +36,10 @@ typedef enum {
     SENSOR_TYPE_ADC,
     SENSOR_TYPE_GPIO,
     SENSOR_TYPE_I2C,
-    SENSOR_TYPE_VIRTUAL,  /* computed/derived values */
+    SENSOR_TYPE_SPI,
+    SENSOR_TYPE_UART,
+    SENSOR_TYPE_PULSE,
+    SENSOR_TYPE_VIRTUAL,
 } sensor_type_t;
 
 typedef enum {
@@ -47,13 +54,42 @@ typedef enum {
 } sensor_unit_t;
 
 /* ========================================================================= */
+/* Anomaly Detection                                                         */
+/* ========================================================================= */
+
+#define ANOMALY_HISTORY_SIZE  8  /* rolling window for stuck/rate detection */
+
+typedef enum {
+    ANOMALY_NONE        = 0,
+    ANOMALY_RATE        = (1 << 0),  /* value changed too fast */
+    ANOMALY_STUCK       = (1 << 1),  /* same value repeated too many times */
+    ANOMALY_RANGE       = (1 << 2),  /* outside physically possible bounds */
+} anomaly_flags_t;
+
+typedef struct {
+    float max_rate;                /* max change per poll (0 = disabled) */
+    float range_lo;                /* minimum valid value (0 = disabled) */
+    float range_hi;                /* maximum valid value (0 = disabled) */
+    int   stuck_threshold;         /* consecutive identical readings (0 = disabled) */
+} anomaly_config_t;
+
+typedef struct {
+    float history[ANOMALY_HISTORY_SIZE];
+    int   history_count;
+    int   stuck_count;
+    float last_value;
+    bool  primed;                  /* false until first valid reading */
+} anomaly_state_t;
+
+/* ========================================================================= */
 /* Sensor Reading                                                            */
 /* ========================================================================= */
 
 typedef struct {
-    float   value;
-    bool    valid;
-    int64_t timestamp_ms;  /* esp_timer epoch */
+    float          value;
+    bool           valid;
+    int64_t        timestamp_ms;   /* esp_timer epoch */
+    anomaly_flags_t anomaly;       /* nonzero if anomaly detected */
 } sensor_reading_t;
 
 /* ========================================================================= */
@@ -80,6 +116,9 @@ typedef struct {
     /* GPIO config (ignored for non-GPIO types) */
     int  gpio_num;
     bool gpio_inverted;
+
+    /* Anomaly detection (all fields optional, 0 = disabled) */
+    anomaly_config_t anomaly;
 } sensor_config_t;
 
 /* ========================================================================= */
@@ -89,7 +128,9 @@ typedef struct {
 typedef struct {
     sensor_config_t  sensors[SENSOR_MAX_COUNT];
     sensor_reading_t readings[SENSOR_MAX_COUNT];
+    anomaly_state_t  anomaly_state[SENSOR_MAX_COUNT];
     size_t           count;
+    SemaphoreHandle_t lock;  /* serializes sensor_hub_poll across tasks */
 } sensor_hub_t;
 
 /**
@@ -135,6 +176,11 @@ int sensor_hub_to_json(const sensor_hub_t *hub, const char *node_name,
 int sensor_hub_capabilities_json(const sensor_hub_t *hub,
                                  char *buf, size_t buf_size);
 
+/**
+ * Human-readable unit string for a sensor_unit_t (e.g. "°C", "%", "KB").
+ */
+const char *sensor_unit_str(sensor_unit_t u);
+
 /* ========================================================================= */
 /* Built-in Sensor Drivers                                                   */
 /* ========================================================================= */
@@ -165,6 +211,11 @@ typedef struct {
 } sensor_ntc_config_t;
 
 bool sensor_driver_ntc(void *ctx, sensor_reading_t *out);
+
+/* ========================================================================= */
+/* Industrial Sensor Drivers (proprietary — see industrial_drivers.c)        */
+/* ========================================================================= */
+/* Not included in OSS build. Contact Aethyr for industrial licensing. */
 
 #ifdef __cplusplus
 }

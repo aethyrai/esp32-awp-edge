@@ -61,7 +61,12 @@ typedef struct {
     uint32_t frames_sent;
     uint32_t frames_received;
     uint32_t reconnect_count;
-    int64_t  connected_since;  /* epoch ms, 0 if disconnected */
+    uint32_t media_frames_dropped;  /* camera/audio capture returned NULL */
+    uint32_t media_send_failures;   /* edge_node_send_media returned error */
+    uint32_t stream_bytes_dropped;  /* awp_stream_feed overflow discards */
+    int64_t  connected_since;       /* epoch ms, 0 if disconnected */
+    int64_t  last_pong_at_ms;       /* epoch ms of most recent PONG, 0 if none */
+    int64_t  last_ping_sent_at_ms;  /* epoch ms of most recent PING send */
 } edge_stats_t;
 
 /* ========================================================================= */
@@ -110,8 +115,9 @@ typedef struct {
     int            sock;
     awp_stream_t   stream;
 
-    /* Transmit buffer — large enough for one frame */
-    uint8_t        tx_buf[AWP_HEADER_SIZE + AWP_ESP32_MAX_PAYLOAD + AWP_CHECKSUM_SIZE];
+    /* Transmit buffer — allocated in PSRAM at init */
+    uint8_t       *tx_buf;
+    size_t         tx_buf_size;
 
     /* HDC cache */
     hdc_cache_t    cache;
@@ -141,6 +147,19 @@ typedef struct {
 /* Public API                                                                */
 /* ========================================================================= */
 
+/* Reboot reason codes — persisted to NVS before esp_restart so the next
+ * boot can log WHY the device rebooted. */
+typedef enum {
+    EDGE_REBOOT_NONE           = 0,  /* clean boot, no prior unclean restart */
+    EDGE_REBOOT_HEAP_CRITICAL  = 1,  /* free heap fell below safe threshold */
+    EDGE_REBOOT_AGENT_REQUEST  = 2,  /* upstream issued a restart agent call */
+    EDGE_REBOOT_CRYPTO_FAIL    = 3,  /* reserved — unrecoverable crypto state */
+} edge_reboot_reason_t;
+
+/* Persist a reason to NVS and call esp_restart. Never returns. */
+__attribute__((noreturn))
+void edge_reboot_with_reason(edge_reboot_reason_t reason);
+
 void edge_node_init(edge_node_t *node, const edge_config_t *config);
 void edge_node_compute_hdc_identity(edge_node_t *node, const sensor_hub_t *sensors);
 void edge_node_start(edge_node_t *node);
@@ -150,6 +169,9 @@ awp_err_t edge_node_announce_capabilities(edge_node_t *node,
                                           const char *capabilities_json);
 awp_err_t edge_node_send_telemetry(edge_node_t *node,
                                    const char *json_payload);
+awp_err_t edge_node_send_media(edge_node_t *node,
+                               const uint8_t *data, size_t len,
+                               const char *media_type);
 edge_state_t edge_node_state(const edge_node_t *node);
 edge_stats_t edge_node_stats(const edge_node_t *node);
 

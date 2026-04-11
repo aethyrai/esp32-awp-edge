@@ -7,6 +7,8 @@ idf_component_register(
         "awp_crypto.c"
         "crypto_test.c"
         "sensor_hub.c"
+        "camera_driver.c"
+        "mic_driver.c"
     INCLUDE_DIRS "."
     REQUIRES
         nvs_flash
@@ -22,4 +24,6 @@ idf_component_register(
         app_update
         blake3
         mlkem768
+        esp32-camera
+        esp_driver_i2s
 )

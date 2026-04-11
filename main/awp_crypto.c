@@ -110,24 +110,57 @@ static uint64_t nonce_load_and_advance(void)
     return next;
 }
 
+/* Tracks consecutive NVS persist failures so a stuck flash doesn't silently
+ * accumulate — after NONCE_PERSIST_FAIL_LIMIT back-to-back failures we log an
+ * error loud enough that operators can't miss it. Successful persists reset
+ * the counter. */
+#define NONCE_PERSIST_FAIL_LIMIT 5
+static uint32_t s_nonce_persist_fails = 0;
+
 static void nonce_persist(uint64_t counter)
 {
     nvs_handle_t nvs;
-    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) != ESP_OK) {
-        ESP_LOGE("awp_crypto", "nonce_persist: NVS open failed");
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) {
+        s_nonce_persist_fails++;
+        ESP_LOGE("awp_crypto", "nonce_persist: NVS open failed: %s (fail_streak=%lu)",
+                 esp_err_to_name(err), (unsigned long)s_nonce_persist_fails);
+        if (s_nonce_persist_fails >= NONCE_PERSIST_FAIL_LIMIT) {
+            ESP_LOGE("awp_crypto",
+                "NONCE PERSIST BROKEN: %lu consecutive failures — NVS flash may be worn or corrupt",
+                (unsigned long)s_nonce_persist_fails);
+        }
         return;
     }
-    esp_err_t err = nvs_set_u64(nvs, NVS_KEY_NONCE, counter + NONCE_BOOT_GAP);
+
+    err = nvs_set_u64(nvs, NVS_KEY_NONCE, counter + NONCE_BOOT_GAP);
     if (err != ESP_OK) {
-        ESP_LOGE("awp_crypto", "nonce_persist: NVS write failed: %s",
-                 esp_err_to_name(err));
+        s_nonce_persist_fails++;
+        ESP_LOGE("awp_crypto", "nonce_persist: NVS write failed: %s (fail_streak=%lu)",
+                 esp_err_to_name(err), (unsigned long)s_nonce_persist_fails);
     } else {
         err = nvs_commit(nvs);
         if (err != ESP_OK) {
-            ESP_LOGE("awp_crypto", "nonce_persist: NVS commit failed: %s",
-                     esp_err_to_name(err));
+            s_nonce_persist_fails++;
+            ESP_LOGE("awp_crypto", "nonce_persist: NVS commit failed: %s (fail_streak=%lu)",
+                     esp_err_to_name(err), (unsigned long)s_nonce_persist_fails);
+        } else {
+            /* Success — clear the streak. */
+            if (s_nonce_persist_fails > 0) {
+                ESP_LOGW("awp_crypto",
+                    "nonce_persist: recovered after %lu failure(s)",
+                    (unsigned long)s_nonce_persist_fails);
+                s_nonce_persist_fails = 0;
+            }
         }
     }
+
+    if (s_nonce_persist_fails >= NONCE_PERSIST_FAIL_LIMIT) {
+        ESP_LOGE("awp_crypto",
+            "NONCE PERSIST BROKEN: %lu consecutive failures — NVS flash may be worn or corrupt",
+            (unsigned long)s_nonce_persist_fails);
+    }
+
     nvs_close(nvs);
 }
 
@@ -220,6 +253,12 @@ bool awp_crypto_accept_handshake(awp_crypto_t *ctx, const char *ct_hex)
 
     /* Set session state */
     ctx->session_ready = (bool)(mask & 1);
+
+    /* Reset ratchet counter — the key is brand new, so ratcheting based
+     * on leftover state from a previous session would be meaningless. */
+    if (ctx->session_ready) {
+        ctx->ratchet_count = 0;
+    }
 
     /* Wipe candidate key */
     volatile uint8_t *ck_ptr = candidate_key;
@@ -319,6 +358,7 @@ static void hchacha20(const uint8_t key[32], const uint8_t nonce[16], uint8_t su
 
 bool awp_crypto_encrypt(awp_crypto_t *ctx,
                         const uint8_t *plain, size_t plain_len,
+                        const uint8_t *aad, size_t aad_len,
                         uint8_t *out, size_t *out_len)
 {
     if (!ctx->session_ready) return false;
@@ -327,14 +367,39 @@ bool awp_crypto_encrypt(awp_crypto_t *ctx,
         return false;
     }
 
-    /* Generate nonce */
-    uint8_t xcnonce[AWP_XCNONCE_SIZE];
+    /* Advance the counter FIRST — the ratchet hash and the on-wire nonce
+     * must use the same counter value. The Python upstream ratchets on
+     * receive using the counter it reads from the wire, which is the
+     * post-increment value; if we ratcheted on the pre-increment value
+     * the derived keys would diverge at every ratchet boundary and every
+     * subsequent frame would fail Poly1305 auth on the peer. */
     ctx->nonce_counter++;
 
     /* Periodic NVS persist */
     if (ctx->nonce_counter % 500 == 0) {
         nonce_persist(ctx->nonce_counter);
     }
+
+    /* Key ratchet — derive a new session key every N frames to limit
+     * exposure if the current key is compromised. Old key is wiped. */
+    ctx->ratchet_count++;
+    if (ctx->ratchet_count >= AWP_RATCHET_INTERVAL) {
+        uint8_t new_key[AWP_KEY_SIZE];
+        blake3_hasher rh;
+        blake3_hasher_init_derive_key(&rh, "awp-ratchet");
+        blake3_hasher_update(&rh, ctx->session_key, AWP_KEY_SIZE);
+        uint64_t rc = ctx->nonce_counter;  /* matches the counter on the wire */
+        blake3_hasher_update(&rh, (const uint8_t *)&rc, sizeof(rc));
+        blake3_hasher_finalize(&rh, new_key, AWP_KEY_SIZE);
+        memset(ctx->session_key, 0, AWP_KEY_SIZE);  /* wipe old key */
+        memcpy(ctx->session_key, new_key, AWP_KEY_SIZE);
+        memset(new_key, 0, sizeof(new_key));
+        ctx->ratchet_count = 0;
+        ESP_LOGD(TAG, "Session key ratcheted at nonce %llu", (unsigned long long)ctx->nonce_counter);
+    }
+
+    /* Generate nonce — counter already incremented above */
+    uint8_t xcnonce[AWP_XCNONCE_SIZE];
 
     esp_fill_random(xcnonce, AWP_XCNONCE_SIZE);
     /* Embed counter */
@@ -363,7 +428,7 @@ bool awp_crypto_encrypt(awp_crypto_t *ctx,
 
     ret = mbedtls_chachapoly_encrypt_and_tag(&chachapoly,
         plain_len, inner_nonce,
-        (const uint8_t *)"awp", 3,
+        aad, aad_len,
         plain, ct_out, tag_out);
 
     mbedtls_chachapoly_free(&chachapoly);
@@ -383,6 +448,7 @@ enc_fail:
 
 bool awp_crypto_decrypt(awp_crypto_t *ctx,
                         const uint8_t *enc, size_t enc_len,
+                        const uint8_t *aad, size_t aad_len,
                         uint8_t *out, size_t *out_len)
 {
     if (!ctx->session_ready) return false;
@@ -408,7 +474,7 @@ bool awp_crypto_decrypt(awp_crypto_t *ctx,
 
     ret = mbedtls_chachapoly_auth_decrypt(&chachapoly,
         plain_len, inner_nonce,
-        (const uint8_t *)"awp", 3,
+        aad, aad_len,
         tag, ct, out);
 
     mbedtls_chachapoly_free(&chachapoly);
@@ -434,34 +500,47 @@ bool awp_crypto_replay_check(awp_crypto_t *ctx, uint64_t counter)
 {
     if (counter == 0) return false;  /* nonce 0 is never valid */
 
+    #define REPLAY_WORDS (AWP_REPLAY_WINDOW / 64)
+
     if (counter > ctx->replay_top) {
         /* New high — shift window forward */
         uint64_t shift = counter - ctx->replay_top;
         if (shift >= AWP_REPLAY_WINDOW) {
-            ctx->replay_bitmap = 0;
+            memset(ctx->replay_bitmap, 0, sizeof(ctx->replay_bitmap));
         } else {
-            ctx->replay_bitmap <<= shift;
+            /* Shift the bitmap array by 'shift' bits */
+            size_t word_shift = shift / 64;
+            size_t bit_shift = shift % 64;
+            for (int i = REPLAY_WORDS - 1; i >= 0; i--) {
+                uint64_t val = 0;
+                if (i >= (int)word_shift)
+                    val = ctx->replay_bitmap[i - word_shift] << bit_shift;
+                if (bit_shift > 0 && i > (int)word_shift)
+                    val |= ctx->replay_bitmap[i - word_shift - 1] >> (64 - bit_shift);
+                ctx->replay_bitmap[i] = val;
+            }
+            for (size_t i = 0; i < word_shift && i < REPLAY_WORDS; i++)
+                ctx->replay_bitmap[i] = 0;
         }
-        ctx->replay_bitmap |= 1;  /* mark current as seen */
+        ctx->replay_bitmap[0] |= 1;  /* mark current as seen (bit 0 = newest) */
         ctx->replay_top = counter;
         return true;
     }
 
     uint64_t diff = ctx->replay_top - counter;
     if (diff >= AWP_REPLAY_WINDOW) {
-        /* Too old — outside window */
         ESP_LOGW(TAG, "Replay: nonce %llu too old (window top=%llu)",
                  (unsigned long long)counter, (unsigned long long)ctx->replay_top);
         return false;
     }
 
-    uint64_t bit = 1ULL << diff;
-    if (ctx->replay_bitmap & bit) {
-        /* Already seen */
+    size_t word_idx = diff / 64;
+    uint64_t bit = 1ULL << (diff % 64);
+    if (ctx->replay_bitmap[word_idx] & bit) {
         ESP_LOGW(TAG, "Replay: duplicate nonce %llu", (unsigned long long)counter);
         return false;
     }
 
-    ctx->replay_bitmap |= bit;
+    ctx->replay_bitmap[word_idx] |= bit;
     return true;
 }

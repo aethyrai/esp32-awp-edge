@@ -27,7 +27,8 @@ extern "C" {
 #define AWP_ENCRYPT_OVERHEAD  (AWP_XCNONCE_SIZE + AWP_TAG_SIZE)
 
 #define AWP_PSK_MAX_SIZE      64
-#define AWP_REPLAY_WINDOW     64
+#define AWP_REPLAY_WINDOW     4096
+#define AWP_RATCHET_INTERVAL  256  /* derive new key every 256 frames */
 
 /* ========================================================================= */
 /* Crypto State                                                              */
@@ -42,8 +43,9 @@ typedef struct {
     uint8_t  psk[AWP_PSK_MAX_SIZE];
     size_t   psk_len;
     uint64_t nonce_counter;
+    uint32_t ratchet_count;      /* frames since last key ratchet */
     uint64_t replay_top;
-    uint64_t replay_bitmap;
+    uint64_t replay_bitmap[AWP_REPLAY_WINDOW / 64];  /* 4096-bit bitmap */
 } awp_crypto_t;
 
 /* ========================================================================= */
@@ -69,10 +71,12 @@ void awp_crypto_auth_token(const awp_crypto_t *ctx, const char *node_id,
 
 bool awp_crypto_encrypt(awp_crypto_t *ctx,
                         const uint8_t *plain, size_t plain_len,
+                        const uint8_t *aad, size_t aad_len,
                         uint8_t *out, size_t *out_len);
 
 bool awp_crypto_decrypt(awp_crypto_t *ctx,
                         const uint8_t *enc, size_t enc_len,
+                        const uint8_t *aad, size_t aad_len,
                         uint8_t *out, size_t *out_len);
 
 static inline bool awp_crypto_has_session(const awp_crypto_t *ctx)

@@ -54,8 +54,11 @@ extern "C" {
 #define AWP_MAX_FRAME_SIZE      (16 * 1024 * 1024)  /* 16 MB */
 #define AWP_MAX_PAYLOAD_SIZE    (AWP_MAX_FRAME_SIZE - 1024)
 
-/* ESP32 practical limits — we cap payload to save RAM */
-#define AWP_ESP32_MAX_PAYLOAD   8192
+/* ESP32 practical limits — large buffers allocated in PSRAM.
+ * Sized for: 2B msg_type + HDC_SIG(512) + 256KB plaintext + ENCRYPT_OVERHEAD(40).
+ * The 256KB cap gives comfortable headroom for HD JPEGs (observed max ~76KB)
+ * and room to grow into FHD resolution without another protocol rev. */
+#define AWP_ESP32_MAX_PAYLOAD   262144
 
 /* Frame flags */
 #define AWP_FLAG_ENCRYPTED      0x0001
@@ -123,6 +126,10 @@ typedef enum {
     AWP_MSG_DIRECTORATE_DELIB   = 0x5D,
     AWP_MSG_DIRECTORATE_CONSENS = 0x5E,
     AWP_MSG_DIRECTORATE_VETO    = 0x5F,
+    /* Edge media stream (0x70-0x7F) */
+    AWP_MSG_MEDIA_FRAME         = 0x70,  /* JPEG frame or audio chunk */
+    AWP_MSG_MEDIA_META          = 0x71,  /* JSON metadata for media stream */
+
     AWP_MSG_ERROR               = 0xF0,
     AWP_MSG_REDIRECT            = 0xF1,
     AWP_MSG_HELLO               = 0xF2,

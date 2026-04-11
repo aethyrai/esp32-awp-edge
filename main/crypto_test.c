@@ -13,6 +13,10 @@
 #include <math.h>
 #include "esp_log.h"
 #include "esp_timer.h"
+
+/* Default AAD for test encrypt/decrypt calls */
+static const uint8_t TEST_AAD[] = { 'a', 'w', 'p', 0, 0, 0, 0 };
+#define TEST_AAD_LEN sizeof(TEST_AAD)
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -164,7 +168,7 @@ static bool test_xchacha_roundtrip(void)
     size_t enc_len = 0;
 
     if (!awp_crypto_encrypt(&ctx, (const uint8_t *)plaintext, pt_len,
-                            encrypted, &enc_len)) {
+                            TEST_AAD, TEST_AAD_LEN, encrypted, &enc_len)) {
         FAIL("encryption failed");
         return false;
     }
@@ -185,7 +189,7 @@ static bool test_xchacha_roundtrip(void)
     uint8_t decrypted[256];
     size_t dec_len = 0;
 
-    if (!awp_crypto_decrypt(&ctx, encrypted, enc_len, decrypted, &dec_len)) {
+    if (!awp_crypto_decrypt(&ctx, encrypted, enc_len, TEST_AAD, TEST_AAD_LEN, decrypted, &dec_len)) {
         FAIL("decryption failed");
         return false;
     }
@@ -220,14 +224,14 @@ static bool test_xchacha_tamper_detect(void)
     uint8_t encrypted[256];
     size_t enc_len = 0;
     awp_crypto_encrypt(&ctx, (const uint8_t *)plaintext, pt_len,
-                       encrypted, &enc_len);
+                       TEST_AAD, TEST_AAD_LEN, encrypted, &enc_len);
 
     /* Flip one bit in the ciphertext */
     encrypted[AWP_XCNONCE_SIZE + 3] ^= 0x01;
 
     uint8_t decrypted[256];
     size_t dec_len = 0;
-    if (awp_crypto_decrypt(&ctx, encrypted, enc_len, decrypted, &dec_len)) {
+    if (awp_crypto_decrypt(&ctx, encrypted, enc_len, TEST_AAD, TEST_AAD_LEN, decrypted, &dec_len)) {
         FAIL("tampered ciphertext was accepted");
         return false;
     }
@@ -254,12 +258,12 @@ static bool test_xchacha_wrong_key(void)
 
     uint8_t encrypted[256];
     size_t enc_len = 0;
-    awp_crypto_encrypt(&ctx1, (const uint8_t *)plaintext, pt_len,
+    awp_crypto_encrypt(&ctx1, (const uint8_t *)plaintext, pt_len, TEST_AAD, TEST_AAD_LEN,
                        encrypted, &enc_len);
 
     uint8_t decrypted[256];
     size_t dec_len = 0;
-    if (awp_crypto_decrypt(&ctx2, encrypted, enc_len, decrypted, &dec_len)) {
+    if (awp_crypto_decrypt(&ctx2, encrypted, enc_len, TEST_AAD, TEST_AAD_LEN, decrypted, &dec_len)) {
         FAIL("wrong key was accepted");
         return false;
     }
@@ -284,8 +288,8 @@ static bool test_xchacha_nonce_uniqueness(void)
     uint8_t enc1[256], enc2[256];
     size_t len1 = 0, len2 = 0;
 
-    awp_crypto_encrypt(&ctx, (const uint8_t *)plaintext, pt_len, enc1, &len1);
-    awp_crypto_encrypt(&ctx, (const uint8_t *)plaintext, pt_len, enc2, &len2);
+    awp_crypto_encrypt(&ctx, (const uint8_t *)plaintext, pt_len, TEST_AAD, TEST_AAD_LEN, enc1, &len1);
+    awp_crypto_encrypt(&ctx, (const uint8_t *)plaintext, pt_len, TEST_AAD, TEST_AAD_LEN, enc2, &len2);
 
     /* Same plaintext, different nonces → different ciphertext */
     if (len1 == len2 && memcmp(enc1, enc2, len1) == 0) {
@@ -414,7 +418,10 @@ static bool test_interop_python_decrypt(void)
     uint8_t decrypted[128];
     size_t dec_len = 0;
 
-    if (!awp_crypto_decrypt(&ctx, encrypted, enc_len, decrypted, &dec_len)) {
+    /* This test vector was generated with Python using aad=b"awp" (3 bytes).
+     * Use the original AAD to verify cross-platform compatibility. */
+    static const uint8_t interop_aad[] = { 'a', 'w', 'p' };
+    if (!awp_crypto_decrypt(&ctx, encrypted, enc_len, interop_aad, 3, decrypted, &dec_len)) {
         FAIL("decryption of Python ciphertext failed");
         return false;
     }
@@ -609,8 +616,8 @@ static void profile_xchacha_task(void *arg)
     const char *pt = "{\"timestamp\":1234567890.123,\"load\":0.0}";
     uint8_t enc[256], dec[256];
     size_t enc_len = 0, dec_len = 0;
-    awp_crypto_encrypt(&ctx, (const uint8_t *)pt, strlen(pt), enc, &enc_len);
-    awp_crypto_decrypt(&ctx, enc, enc_len, dec, &dec_len);
+    awp_crypto_encrypt(&ctx, (const uint8_t *)pt, strlen(pt), TEST_AAD, TEST_AAD_LEN, enc, &enc_len);
+    awp_crypto_decrypt(&ctx, enc, enc_len, TEST_AAD, TEST_AAD_LEN, dec, &dec_len);
     s_profile_hwm = uxTaskGetStackHighWaterMark(NULL);
     xSemaphoreGive(s_profile_sem);
     vTaskDelete(NULL);
@@ -678,6 +685,87 @@ static void bench_report(const char *name, float *times, int n)
 }
 
 /* ========================================================================= */
+/* Replay Window                                                             */
+/* ========================================================================= */
+
+static bool test_replay_window(void)
+{
+    TEST("Replay window: accept / duplicate / too-old");
+
+    awp_crypto_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+
+    /* Nonce 0 is never valid. */
+    if (awp_crypto_replay_check(&ctx, 0)) {
+        FAIL("nonce 0 was accepted");
+        return false;
+    }
+
+    /* Fresh counter 1 accepts, duplicate rejects. */
+    if (!awp_crypto_replay_check(&ctx, 1)) {
+        FAIL("fresh counter 1 rejected");
+        return false;
+    }
+    if (awp_crypto_replay_check(&ctx, 1)) {
+        FAIL("duplicate counter 1 accepted");
+        return false;
+    }
+
+    /* Jump ahead — shifts the window forward. Counter 5 accepts. */
+    if (!awp_crypto_replay_check(&ctx, 5)) {
+        FAIL("jump-ahead counter 5 rejected");
+        return false;
+    }
+    if (awp_crypto_replay_check(&ctx, 5)) {
+        FAIL("duplicate counter 5 accepted");
+        return false;
+    }
+
+    /* Out-of-order counter 3 is unseen and in-window — must accept. */
+    if (!awp_crypto_replay_check(&ctx, 3)) {
+        FAIL("in-window unseen counter 3 rejected");
+        return false;
+    }
+    /* Now 3 is marked seen — duplicate must reject. */
+    if (awp_crypto_replay_check(&ctx, 3)) {
+        FAIL("duplicate counter 3 accepted after insertion");
+        return false;
+    }
+
+    /* Counter 2 is also in-window and still unseen — must accept. */
+    if (!awp_crypto_replay_check(&ctx, 2)) {
+        FAIL("in-window unseen counter 2 rejected");
+        return false;
+    }
+
+    /* Jump far forward. Old counters become too-old. */
+    if (!awp_crypto_replay_check(&ctx, 10000)) {
+        FAIL("big jump rejected");
+        return false;
+    }
+    if (awp_crypto_replay_check(&ctx, 5)) {
+        FAIL("too-old counter 5 accepted after big jump");
+        return false;
+    }
+
+    /* Counter just inside the window should still accept. */
+    uint64_t inside = 10000 - (AWP_REPLAY_WINDOW - 1);
+    if (!awp_crypto_replay_check(&ctx, inside)) {
+        FAIL("counter at window edge was rejected");
+        return false;
+    }
+    /* Counter just outside the window must reject. */
+    uint64_t outside = 10000 - AWP_REPLAY_WINDOW;
+    if (awp_crypto_replay_check(&ctx, outside)) {
+        FAIL("counter outside window was accepted");
+        return false;
+    }
+
+    PASS();
+    return true;
+}
+
+/* ========================================================================= */
 /* Run All Tests                                                             */
 /* ========================================================================= */
 
@@ -710,6 +798,9 @@ bool crypto_self_test(void)
     ESP_LOGI(TAG, "--- Cross-Platform Interop ---");
     test_interop_blake3_kdf_match();
     test_interop_python_decrypt();
+
+    ESP_LOGI(TAG, "--- Replay Window ---");
+    test_replay_window();
 
     ESP_LOGI(TAG, "--- AWP Frames ---");
     test_awp_frame_roundtrip();
@@ -815,7 +906,7 @@ bool crypto_self_test(void)
             cx.nonce_counter = i + 1;
             uint8_t enc[128]; size_t elen = 0;
             int64_t t = esp_timer_get_time();
-            awp_crypto_encrypt(&cx, (const uint8_t *)pt, strlen(pt), enc, &elen);
+            awp_crypto_encrypt(&cx, (const uint8_t *)pt, strlen(pt), TEST_AAD, TEST_AAD_LEN, enc, &elen);
             times[i] = (float)(esp_timer_get_time() - t);
             vTaskDelay(1);
         }

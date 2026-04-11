@@ -22,10 +22,20 @@ test/test_stress
 # Logs
 log/
 
-# Demo artifacts
+# Demo artifacts and recordings
 demo.cast
 demo.gif
 demo.mp4
+demo-e2e.cast
+demo-e2e-public.cast
+demo-e2e-public.gif
+demo-e2e-public.mp4
+
+# Proprietary industrial sensor drivers — not OSS
+main/industrial_drivers.c
+
+# Deployment scripts with site-specific secrets
+scripts/enable-pmf-ap.sh
 
 # Internal docs and benchmarks — protocol details stay private
 docs/
