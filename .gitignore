@@ -40,3 +40,4 @@ scripts/enable-pmf-ap.sh
 # Internal docs and benchmarks — protocol details stay private
 docs/
 BENCHMARKS.md
+CLAUDE.md
