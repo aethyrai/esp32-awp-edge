@@ -55,18 +55,51 @@ menu "AWP Edge Node Configuration"
             How often to send PING to upstream node.
 
     config AWP_PSK
-        string "Pre-shared key (hex, up to 64 bytes)"
+        string "Pre-shared key (hex, minimum 16 bytes / 32 hex chars)"
         default ""
         help
-            Hex-encoded pre-shared key for mutual authentication.
-            Both edge node and upstream must have the same PSK.
-            Leave empty to disable (WARNING: MITM possible without PSK).
-            Can also be provisioned via NVS key "awp_psk" in namespace "awp_crypto".
+            Hex-encoded pre-shared key. REQUIRED for secure handshake.
+
+            The PSK is mixed into session-key derivation (KDF(ss || psk)).
+            An attacker who does not know the PSK cannot recover the
+            session key even with full network control, because the
+            ML-KEM handshake alone does not authenticate the upstream.
+            A formal audit (docs/audits/formal/REPORT.md, finding F-01)
+            showed the protocol reduces to unauthenticated ephemeral KEX
+            without a secret PSK.
+
+            Minimum 16 bytes (32 hex chars) is enforced at boot.
+            Up to 64 bytes (128 hex chars) supported.
+
+            Can also be provisioned via NVS key "awp_psk" in namespace
+            "awp_crypto". NVS provisioning takes priority over Kconfig.
+
+    config AWP_REQUIRE_PSK
+        bool "Require PSK at boot (recommended)"
+        default y
+        help
+            When enabled, the device refuses to start without a valid PSK.
+            Disabling is only for bring-up and testing against a trusted,
+            isolated network; production deployments MUST keep this enabled.
 
     config AWP_RECONNECT_BACKOFF_MAX_MS
         int "Max reconnect backoff (ms)"
         default 60000
         help
             Maximum delay between reconnection attempts (exponential backoff).
+
+    config AWP_INCLUDE_SELF_TESTS
+        bool "Compile and run crypto self-tests on boot"
+        default y
+        help
+            When enabled, 14 crypto self-tests (BLAKE3, XChaCha20-Poly1305,
+            ML-KEM-768, replay window, frame roundtrip, tamper detection)
+            run at boot and halt the device on failure.
+
+            Disable for production images where the tests have already
+            been validated on the exact firmware revision being shipped —
+            this strips ~30 KB of test code and vectors from the image
+            and reduces attack surface (audit F-08). Build-time validation
+            must be performed on an image with this option enabled.
 
 endmenu

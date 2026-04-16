@@ -28,7 +28,17 @@ extern "C" {
 
 #define AWP_PSK_MAX_SIZE      64
 #define AWP_REPLAY_WINDOW     4096
-#define AWP_RATCHET_INTERVAL  256  /* derive new key every 256 frames */
+#define AWP_RATCHET_INTERVAL  256   /* derive new key every 256 frames */
+#define AWP_NONCE_BOOT_GAP    1000  /* nonce jump across reboots */
+#define AWP_NONCE_PERSIST_EVERY 500 /* persist counter to NVS every N frames */
+
+/* Nonce-reuse safety (audit F-06): on reboot we jump by AWP_NONCE_BOOT_GAP,
+ * and we only persist every AWP_NONCE_PERSIST_EVERY frames. The gap MUST
+ * exceed the persist interval, otherwise a crash between persists can
+ * reuse nonces within the same key_epoch. Verified by the TLA+ model in
+ * docs/audits/formal/tlaplus/ReplayWindow.tla. */
+_Static_assert(AWP_NONCE_BOOT_GAP > AWP_NONCE_PERSIST_EVERY,
+               "AWP_NONCE_BOOT_GAP must exceed persist interval; see audit F-06");
 
 /* ========================================================================= */
 /* Crypto State                                                              */
@@ -84,6 +94,26 @@ static inline bool awp_crypto_has_session(const awp_crypto_t *ctx)
     return ctx->session_ready;
 }
 
+/**
+ * Sliding-window replay check over monotonic counters.
+ *
+ * WARNING (audit F-04): this function is currently exercised ONLY by
+ * the boot self-tests. The production inbound path in
+ * awp_edge_node.c:connection_task deliberately does NOT call it
+ * because the Python mesh-tier upstream emits XChaCha20 nonces with
+ * random high bytes rather than a monotonic counter — feeding those
+ * to this check produces spurious rejections.
+ *
+ * Consequence: frames received from upstream are NOT replay-protected
+ * at the AWP layer. Replay resistance relies on (a) fresh per-handshake
+ * session keys, and (b) TCP in-order delivery. An adversary with the
+ * ability to inject packets into an established TCP session could
+ * resubmit a previously observed encrypted frame and have it accepted.
+ *
+ * TODO: make the upstream emit counter-based nonces so this check can
+ * be wired in symmetrically. Until then, do NOT rely on this function
+ * for inbound protection in production code paths.
+ */
 bool awp_crypto_replay_check(awp_crypto_t *ctx, uint64_t counter);
 
 #ifdef __cplusplus

@@ -10,6 +10,7 @@
 #include "blake3.h"
 #include "esp_log.h"
 #include "esp_random.h"
+#include "esp_heap_caps.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 
@@ -68,7 +69,8 @@ static void derive_session_key(const uint8_t *shared_secret, size_t ss_len,
 
 #define NVS_NAMESPACE   "awp_crypto"
 #define NVS_KEY_NONCE   "nonce_ctr"
-#define NONCE_BOOT_GAP  1000
+#define NONCE_BOOT_GAP     AWP_NONCE_BOOT_GAP
+#define NONCE_PERSIST_EVERY AWP_NONCE_PERSIST_EVERY
 
 static uint64_t nonce_load_and_advance(void)
 {
@@ -223,17 +225,25 @@ bool awp_crypto_accept_handshake(awp_crypto_t *ctx, const char *ct_hex)
         return false;
     }
 
-    /* Decode ciphertext from hex */
-    uint8_t ct[AWP_KEM_CT_SIZE];
-    int ct_len = hex_to_bytes(ct_hex, ct, sizeof(ct));
+    /* Decode ciphertext from hex. Allocated in PSRAM to keep the
+     * 1088-byte KEM ciphertext off the task stack — see audit F-03. */
+    uint8_t *ct = heap_caps_malloc(AWP_KEM_CT_SIZE, MALLOC_CAP_SPIRAM);
+    if (!ct) {
+        ESP_LOGE(TAG, "Ciphertext buffer alloc failed");
+        return false;
+    }
+    int ct_len = hex_to_bytes(ct_hex, ct, AWP_KEM_CT_SIZE);
     if (ct_len != AWP_KEM_CT_SIZE) {
         ESP_LOGW(TAG, "Bad ciphertext length: %d (expected %d)", ct_len, AWP_KEM_CT_SIZE);
+        heap_caps_free(ct);
         return false;
     }
 
     /* Decapsulate */
     uint8_t shared_secret[AWP_KEM_SS_SIZE];
     int ret = pqcrystals_kyber768_ref_dec(shared_secret, ct, ctx->kem_sk);
+    /* Ciphertext no longer needed — free immediately. */
+    heap_caps_free(ct);
 
     /* Derive session key */
     uint8_t candidate_key[AWP_KEY_SIZE];
@@ -375,8 +385,8 @@ bool awp_crypto_encrypt(awp_crypto_t *ctx,
      * subsequent frame would fail Poly1305 auth on the peer. */
     ctx->nonce_counter++;
 
-    /* Periodic NVS persist */
-    if (ctx->nonce_counter % 500 == 0) {
+    /* Periodic NVS persist — interval tied to boot gap by static assert. */
+    if (ctx->nonce_counter % NONCE_PERSIST_EVERY == 0) {
         nonce_persist(ctx->nonce_counter);
     }
 

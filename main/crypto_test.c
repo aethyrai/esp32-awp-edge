@@ -1,6 +1,13 @@
 /**
- * Crypto self-test suite — runs on every boot
+ * Crypto self-test suite — runs on every boot when
+ * CONFIG_AWP_INCLUDE_SELF_TESTS is enabled. The entire body is
+ * compiled out otherwise (audit F-08); crypto_test.h provides a
+ * stub crypto_self_test() returning true in that case.
  */
+
+#include "sdkconfig.h"
+
+#if CONFIG_AWP_INCLUDE_SELF_TESTS
 
 #include "crypto_test.h"
 #include "awp_protocol.h"
@@ -946,3 +953,5 @@ bool crypto_self_test(void)
 
     return tests_passed == tests_run;
 }
+
+#endif /* CONFIG_AWP_INCLUDE_SELF_TESTS */

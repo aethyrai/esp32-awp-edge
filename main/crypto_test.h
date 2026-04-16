@@ -16,8 +16,15 @@ extern "C" {
 /**
  * Run all crypto self-tests. Returns true if all pass.
  * Logs each test result. Intended to run once at boot.
+ *
+ * When CONFIG_AWP_INCLUDE_SELF_TESTS is disabled (audit F-08), this
+ * resolves to a stub that returns true — tests are compiled out.
  */
+#if CONFIG_AWP_INCLUDE_SELF_TESTS
 bool crypto_self_test(void);
+#else
+static inline bool crypto_self_test(void) { return true; }
+#endif
 
 #ifdef __cplusplus
 }

@@ -342,12 +342,18 @@ static awp_err_t do_handshake(edge_node_t *node)
     node->crypto.replay_top = 0;
     memset(node->crypto.replay_bitmap, 0, sizeof(node->crypto.replay_bitmap));
 
-    /* Build HELLO payload — static buffer, no heap allocation */
+    /* Build HELLO payload. The KEM encapsulation-key hex is ~2.4 KB —
+     * allocate in PSRAM rather than on the task stack (audit F-02). */
     static char hello_json[3072];
-    char kem_ek_hex[AWP_KEM_PK_SIZE * 2 + 1];
+    const size_t kem_ek_hex_size = AWP_KEM_PK_SIZE * 2 + 1;
+    char *kem_ek_hex = heap_caps_malloc(kem_ek_hex_size, MALLOC_CAP_SPIRAM);
+    if (!kem_ek_hex) {
+        ESP_LOGE(TAG, "kem_ek_hex alloc failed");
+        return AWP_ERR_NOMEM;
+    }
     kem_ek_hex[0] = '\0';
     if (node->crypto.kem_ready) {
-        awp_crypto_get_ek_hex(&node->crypto, kem_ek_hex, sizeof(kem_ek_hex));
+        awp_crypto_get_ek_hex(&node->crypto, kem_ek_hex, kem_ek_hex_size);
     }
 
     int plen;
@@ -367,6 +373,8 @@ static awp_err_t do_handshake(edge_node_t *node)
             node->node_id, node->config.node_name,
             (int)node->config.listen_port, (int)node->cache.capacity);
     }
+    heap_caps_free(kem_ek_hex);
+    kem_ek_hex = NULL;
     if (plen < 0 || plen >= (int)sizeof(hello_json)) return AWP_ERR_ENCODE;
 
     awp_frame_t hello;
@@ -382,6 +390,11 @@ static awp_err_t do_handshake(edge_node_t *node)
     ESP_LOGI(TAG, "HELLO payload: %d bytes (KEM key %s)",
              plen, node->crypto.kem_ready ? "included" : "omitted");
 
+    /* NOTE: HELLO is emitted in plaintext by design. No session key
+     * exists yet, so there is nothing to encrypt under. Observers
+     * learn node_id and the 1184-byte ML-KEM encapsulation key —
+     * audit F-07 flags this as a fingerprinting vector but not a
+     * confidentiality break. */
     err = send_raw(node, node->tx_buf, enc_len);
     if (err != AWP_OK) return err;
 
@@ -391,20 +404,28 @@ static awp_err_t do_handshake(edge_node_t *node)
     int64_t deadline = esp_timer_get_time() / 1000 + 10000; /* 10s timeout */
     awp_stream_clear(&node->stream);
 
+    /* 4 KB recv buffer in PSRAM instead of on stack (audit F-02). */
+    uint8_t *rx_buf = heap_caps_malloc(4096, MALLOC_CAP_SPIRAM);
+    if (!rx_buf) {
+        ESP_LOGE(TAG, "handshake rx_buf alloc failed");
+        return AWP_ERR_NOMEM;
+    }
+
+    awp_err_t result = AWP_ERR_DECODE;
+
     while (esp_timer_get_time() / 1000 < deadline) {
-        uint8_t rx_buf[4096];
-        int n = recv(node->sock, rx_buf, sizeof(rx_buf), 0);
+        int n = recv(node->sock, rx_buf, 4096, 0);
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 vTaskDelay(pdMS_TO_TICKS(50));
                 continue;
             }
             ESP_LOGE(TAG, "recv() during handshake: errno %d", errno);
-            return AWP_ERR_DECODE;
+            goto handshake_done;
         }
         if (n == 0) {
             ESP_LOGE(TAG, "Connection closed during handshake");
-            return AWP_ERR_DECODE;
+            goto handshake_done;
         }
 
         awp_frame_t frames[4];
@@ -414,7 +435,7 @@ static awp_err_t do_handshake(edge_node_t *node)
         if (feed_err != AWP_OK) {
             ESP_LOGE(TAG, "Stream feed error during handshake: %s",
                      awp_err_str(feed_err));
-            return AWP_ERR_DECODE;
+            goto handshake_done;
         }
 
         for (size_t i = 0; i < count; i++) {
@@ -435,14 +456,14 @@ static awp_err_t do_handshake(edge_node_t *node)
                     free(ack_json);
                     if (!jack) {
                         ESP_LOGE(TAG, "HELLO_ACK JSON parse failed");
-                        return AWP_ERR_DECODE;
+                        goto handshake_done;
                     }
 
                     cJSON *ct_item = cJSON_GetObjectItem(jack, "kem_ciphertext");
                     if (!cJSON_IsString(ct_item) || !ct_item->valuestring) {
                         ESP_LOGE(TAG, "SECURITY: No KEM ciphertext in HELLO_ACK — refusing unencrypted session");
                         cJSON_Delete(jack);
-                        return AWP_ERR_DECODE;  /* Abort — downgrade attack prevention */
+                        goto handshake_done;  /* Abort — downgrade attack prevention */
                     }
 
                     const char *ct_hex = ct_item->valuestring;
@@ -465,7 +486,7 @@ static awp_err_t do_handshake(edge_node_t *node)
                     /* Refuse connection without PQC session */
                     if (!awp_crypto_has_session(&node->crypto)) {
                         ESP_LOGE(TAG, "SECURITY: PQC handshake did not complete — aborting");
-                        return AWP_ERR_DECODE;
+                        goto handshake_done;
                     }
 
                     /* Send auth token — static buffer, no heap allocation */
@@ -493,13 +514,17 @@ static awp_err_t do_handshake(edge_node_t *node)
                     ESP_LOGI(TAG, "Sent encrypted auth token");
                 }
 
-                return AWP_OK;
+                result = AWP_OK;
+                goto handshake_done;
             }
         }
     }
 
     ESP_LOGW(TAG, "HELLO_ACK timeout");
-    return AWP_ERR_DECODE;
+
+handshake_done:
+    heap_caps_free(rx_buf);
+    return result;
 }
 
 /* ========================================================================= */

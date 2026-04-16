@@ -658,9 +658,10 @@ static size_t load_psk(uint8_t *psk_out, size_t max_len)
         }
     }
 
-    ESP_LOGW(TAG, "No PSK configured — MITM protection inactive");
     return 0;
 }
+
+#define AWP_PSK_MIN_SIZE 16   /* 128 bits — matches formal audit F-01 */
 
 void app_main(void)
 {
@@ -683,9 +684,25 @@ void app_main(void)
     sensor_hub_init(&g_sensors);
     register_sensors();
 
-    /* Load PSK for mutual authentication */
+    /* Load PSK for mutual authentication. Without a secret PSK the
+     * handshake admits an active MITM that learns the session key —
+     * see docs/audits/formal/REPORT.md F-01. */
     uint8_t psk_buf[AWP_PSK_MAX_SIZE];
     size_t psk_len = load_psk(psk_buf, sizeof(psk_buf));
+
+    if (psk_len < AWP_PSK_MIN_SIZE) {
+#if CONFIG_AWP_REQUIRE_PSK
+        ESP_LOGE(TAG, "SECURITY: PSK missing or too short (%zu < %d bytes).",
+                 psk_len, AWP_PSK_MIN_SIZE);
+        ESP_LOGE(TAG, "Provision a PSK via NVS ('awp_crypto'/'awp_psk') or");
+        ESP_LOGE(TAG, "idf.py menuconfig -> AWP Edge Node Configuration -> PSK.");
+        ESP_LOGE(TAG, "Refusing to start without authenticated handshake.");
+        while (1) { vTaskDelay(pdMS_TO_TICKS(5000)); }
+#else
+        ESP_LOGW(TAG, "CONFIG_AWP_REQUIRE_PSK=n and PSK is short/missing — "
+                      "handshake is vulnerable to active MITM (audit F-01)");
+#endif
+    }
 
     /* Configure edge node */
     edge_config_t config = {

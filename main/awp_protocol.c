@@ -9,6 +9,7 @@
 
 #include "blake3.h"
 #include "esp_log.h"
+#include "mbedtls/constant_time.h"
 
 static const char *TAG = "awp_proto";
 
@@ -183,7 +184,10 @@ awp_err_t awp_decode_frame(const uint8_t *data, size_t data_len,
     uint8_t computed[AWP_CHECKSUM_SIZE];
     awp_blake2b_checksum(data, frame_data_len, computed);
 
-    if (memcmp(computed, data + frame_data_len, AWP_CHECKSUM_SIZE) != 0) {
+    /* Constant-time compare — BLAKE3 checksum is unkeyed so leakage
+     * here is not a confidentiality break, but using mbedtls_ct_memcmp
+     * removes a reviewer red flag (audit F-05). */
+    if (mbedtls_ct_memcmp(computed, data + frame_data_len, AWP_CHECKSUM_SIZE) != 0) {
         ESP_LOGW(TAG, "Checksum mismatch");
         return AWP_ERR_CHECKSUM;
     }
